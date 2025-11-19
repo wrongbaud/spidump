@@ -71,13 +71,11 @@ class EEPROMReq(Packet):
         # First byte: opcode
         ByteEnumField("cmd", CMD_READ, COMMANDS),
 
-        # 24-bit address for address-carrying commands
         ConditionalField(
             ThreeBytesField("addr", 0x000000),
             lambda pkt: pkt.cmd in pkt.CMD_HAS_ADDR,
         ),
 
-        # For write-like commands, include a data length + data
         ConditionalField(
             FieldLenField("dlen", None, count_of="data", fmt="H"),
             lambda pkt: pkt.cmd in pkt.CMD_HAS_DATA,
@@ -98,7 +96,6 @@ class EEPROMResp(Packet):
     ]
 
 
-# Bind SPI -> EEPROMReq so SPI()/EEPROMReq() stacks nicely
 bind_layers(SPI, EEPROMReq, cs=0)
 
 from scapy.fields import FlagsField
