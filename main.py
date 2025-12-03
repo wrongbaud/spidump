@@ -8,6 +8,7 @@ from scapy.packet import Packet
 from scapy.fields import (
     ByteEnumField,
     ThreeBytesField,
+    NBytesField,
     ConditionalField,
     FieldLenField,
     StrLenField,
@@ -50,15 +51,19 @@ class EEPROMReq(Packet):
         0x06: "WREN",
         0x04: "WRDI",
         0x05: "RDSR",
+        0x0B: "FSRD",
+
     }
 
     CMD_READ = 0x03
     CMD_WRITE = 0x02
     CMD_RDSR = 0x05
+    CMD_FAST_READ = 0x0B
 
     CMD_HAS_ADDR = {
         CMD_READ,
         CMD_WRITE,
+        CMD_FAST_READ,
     }
 
     CMD_HAS_DATA = {
@@ -69,10 +74,10 @@ class EEPROMReq(Packet):
 
     fields_desc = [
         # First byte: opcode
-        ByteEnumField("cmd", CMD_READ, COMMANDS),
+        ByteEnumField("cmd", CMD_FAST_READ, COMMANDS),
 
         ConditionalField(
-            ThreeBytesField("addr", 0x000000),
+           NBytesField("addr", 0x000000,4),
             lambda pkt: pkt.cmd in pkt.CMD_HAS_ADDR,
         ),
 
@@ -208,7 +213,7 @@ def build_eeprom_req_resp_from_bytes(mosi_bytes, miso_bytes):
             | (mosi_bytes[offset + 2])
         )
         req.addr = addr
-        offset += 3
+        offset += 4
 
     if cmd in EEPROMReq.CMD_HAS_DATA and len(mosi_bytes) > offset:
         data_out = bytes(mosi_bytes[offset:])
@@ -216,7 +221,7 @@ def build_eeprom_req_resp_from_bytes(mosi_bytes, miso_bytes):
         req.data = data_out
 
     resp = None
-    if cmd == EEPROMReq.CMD_READ and len(miso_bytes) > offset:
+    if cmd == EEPROMReq.CMD_FAST_READ and len(miso_bytes) > offset:
         data_in = bytes(miso_bytes[offset:])
         resp = EEPROMResp(data=data_in)
     elif cmd == EEPROMReq.CMD_RDSR and len(miso_bytes) > offset:
@@ -232,7 +237,7 @@ def reconstruct_flash_image(packets, flash_size=None, fill=0xFF):
         req = info["req"]
         resp = info.get("resp")
 
-        if req.cmd != EEPROMReq.CMD_READ or resp is None:
+        if req.cmd != EEPROMReq.CMD_FAST_READ or resp is None:
             continue
 
         addr = getattr(req, "addr", None)
@@ -271,7 +276,7 @@ def reconstruct_flash_image(packets, flash_size=None, fill=0xFF):
     return bytes(image), coverage
 
 if __name__ == "__main__":
-    path = "/home/wrongbaud/projects/tt-spi-reconstruction/spidump/examples/bigger-boot.csv"
+    path = sys.argv[1]
 
     packets = build_packets_from_spi_log(path)
     print(f"Decoded {len(packets)} SPI transactions")
