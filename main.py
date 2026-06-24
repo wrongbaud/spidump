@@ -1,299 +1,407 @@
-import csv
+"""spidump — parse SPI/QSPI logic-analyzer captures and reconstruct flash images.
+
+The protocol is modelled with Scapy (see ``SPIFlashCmd``); the actual bytes are
+fed in from one of three logic-analyzer export formats, auto-detected by header:
+
+1. Saleae Logic 2 "SPI" analyzer data table   (name,type,start_time,...,mosi,miso)
+   - rows of type enable / result / disable, one ``result`` per clocked byte.
+2. Saleae raw per-byte table                  (Time [s],Packet ID,MOSI,MISO)
+   - one row per byte, transactions grouped by Packet ID.
+3. QSPI-Analyzer export                        (Time [s],Packet ID, Transaction State, DATA, Lines Used)
+   - state machine: 1=command, 2=address, 3=dummy, 4=data byte.
+
+Whatever the wire width (single-lane SPI or 4-lane QSPI), a *logical* flash read
+is the same thing — an opcode, an address, and a run of data bytes — so the same
+Scapy model and the same ``reconstruct_image`` routine handle all three.
+"""
+
 import argparse
 import sys
 import logging
-import csv
-from collections import OrderedDict
-from scapy.packet import Packet
+from collections import Counter
+
+from scapy.packet import Packet, bind_layers
 from scapy.fields import (
     ByteEnumField,
+    ByteField,
     ThreeBytesField,
-    NBytesField,
     ConditionalField,
     FieldLenField,
     StrLenField,
+    FlagsField,
 )
-from scapy.all import bind_layers
+
+logger = logging.getLogger("spidump")
 
 
-
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-CMD_OUT=0
-CMD_IN=1
-
-class SPICmd:
-
-    def __init__(self,cmd_code,name,expected_resp_len,direction):
-        self.name = name
-        self.len = expected_resp_len
-        self.resp = None
-        self.direction = direction
-
-READ = SPICmd(0x3,"READ",0,CMD_IN)
-READ_SR = SPICmd(0x5,"READ_STATUS_REGISTER",1,CMD_IN)
-WRITE_DISABLE = SPICmd(0x2,"WRITE_DISABLE",0,CMD_OUT)
-WRITE_SR_1 = SPICmd(0x01,"Write Staus Register 1",1,CMD_OUT)
-READ_SR_2 = SPICmd(0x35 ,"Read Status Register 2",1,CMD_IN)
-
-
+# ---------------------------------------------------------------------------
+# Scapy protocol model
+# ---------------------------------------------------------------------------
 class SPI(Packet):
+    """Base layer — which chip-select line a transaction belonged to."""
+
     name = "SPI"
     fields_desc = [
-        ByteEnumField("cs", 0, {0: "eeprom"}),  # you can add more CS lines here
+        ByteEnumField("cs", 0, {0: "flash"}),  # add more CS lines as needed
     ]
 
-class EEPROMReq(Packet):
-    name = "EEPROMReq"
+
+class SPIFlashCmd(Packet):
+    """A single SPI/QSPI NOR flash command header (the request side)."""
+
+    name = "SPIFlashCmd"
+
     COMMANDS = {
-        0x03: "READ",
-        0x02: "WRITE",
+        0x03: "READ",                 # 1-1-1
+        0x0B: "FAST_READ",            # 1-1-1, +1 dummy byte
+        0x3B: "FAST_READ_DUAL_OUT",   # 1-1-2, +dummy
+        0x6B: "FAST_READ_QUAD_OUT",   # 1-1-4, +dummy
+        0xEB: "FAST_READ_QUAD_IO",    # 1-4-4, +dummy
+        0x0C: "FAST_READ_4B",         # 1-1-1, 32-bit addr, +dummy
+        0x6C: "FAST_READ_QUAD_OUT_4B",  # 1-1-4, 32-bit addr, +dummy
+        0x02: "PAGE_PROGRAM",
+        0x20: "SECTOR_ERASE",
+        0x05: "RDSR1",
+        0x35: "RDSR2",
         0x06: "WREN",
         0x04: "WRDI",
-        0x05: "RDSR",
-        0x0B: "FSRD",
+        0x9F: "JEDEC_ID",
+    }
 
+    # Commands whose data we can place back into the image at an address.
+    READ_COMMANDS = {0x03, 0x0B, 0x3B, 0x6B, 0xEB, 0x0C, 0x6C}
+    # Commands that clock out an address after the opcode.
+    CMD_HAS_ADDR = {0x03, 0x0B, 0x3B, 0x6B, 0xEB, 0x0C, 0x6C, 0x02, 0x20}
+    # ...and of those, which insert dummy cycles before data starts.
+    CMD_HAS_DUMMY = {0x0B, 0x3B, 0x6B, 0xEB, 0x0C, 0x6C}
+    # Commands using a 32-bit (4-byte) address instead of the usual 24-bit.
+    CMD_4B_ADDR = {0x0C, 0x6C}
+
+    # Lane width of the DATA phase per read opcode (1=single, 2=dual, 4=quad).
+    # Used to reject reads decoded at the wrong width — e.g. a 0x6B quad read
+    # that a *single-lane* analyzer mis-decoded as 1-bit data (garbage). This is
+    # what makes merging a single-lane leg with a quad leg safe and automatic.
+    DATA_LANES = {
+        0x03: 1, 0x0B: 1, 0x0C: 1, 0x13: 1,
+        0x3B: 2,
+        0x6B: 4, 0xEB: 4, 0x6C: 4, 0xEC: 4,
     }
 
     CMD_READ = 0x03
-    CMD_WRITE = 0x02
-    CMD_RDSR = 0x05
-    CMD_FAST_READ = 0x0B
 
-    CMD_HAS_ADDR = {
-        CMD_READ,
-        CMD_WRITE,
-        CMD_FAST_READ,
-    }
-
-    CMD_HAS_DATA = {
-        CMD_WRITE,
-        0x01,
-        0x5,
-    }
-
+    # NOTE: lane width (1/2/4) is *metadata*, not part of the logical byte
+    # stream, so it is deliberately not a Scapy field — it lives on .lines.
     fields_desc = [
-        # First byte: opcode
-        ByteEnumField("cmd", CMD_FAST_READ, COMMANDS),
-
+        ByteEnumField("cmd", CMD_READ, COMMANDS),
         ConditionalField(
-           NBytesField("addr", 0x000000,4),
-            lambda pkt: pkt.cmd in pkt.CMD_HAS_ADDR,
-        ),
-
-        ConditionalField(
-            FieldLenField("dlen", None, count_of="data", fmt="H"),
-            lambda pkt: pkt.cmd in pkt.CMD_HAS_DATA,
+            ThreeBytesField("addr", 0),
+            lambda p: p.cmd in p.CMD_HAS_ADDR,
         ),
         ConditionalField(
-            StrLenField("data", b"", length_from=lambda pkt: pkt.dlen),
-            lambda pkt: pkt.cmd in pkt.CMD_HAS_DATA,
+            ByteField("dummy", 0),
+            lambda p: p.cmd in p.CMD_HAS_DUMMY,
         ),
     ]
 
 
-class EEPROMResp(Packet):
-    name = "EEPROMResp"
-
+class SPIFlashReadResp(Packet):
+    name = "SPIFlashReadResp"
     fields_desc = [
         FieldLenField("dlen", None, count_of="data", fmt="H"),
-        StrLenField("data", b"", length_from=lambda pkt: pkt.dlen),
+        StrLenField("data", b"", length_from=lambda p: p.dlen),
     ]
 
 
-bind_layers(SPI, EEPROMReq, cs=0)
-
-from scapy.fields import FlagsField
-
-class EEPROMStatusResp(Packet):
-    name = "EEPROMStatusResp"
-
+class SPIFlashStatusResp(Packet):
+    name = "SPIFlashStatusResp"
     fields_desc = [
-        FlagsField(
-            "sr", 0, 8,
-            {
-                0x01: "WIP",
-                0x02: "WEL",
-                0x04: "BP0",
-                0x08: "BP1",
-                0x10: "BP2",
-                0x20: "TB",
-                0x40: "SEC",
-                0x80: "SRP0",
-            },
-        )
+        FlagsField("sr", 0, 8, {
+            0x01: "BUSY",
+            0x02: "WEL",
+            0x04: "BP0",
+            0x08: "BP1",
+            0x10: "BP2",
+            0x20: "TB",
+            0x40: "SEC",
+            0x80: "SRP0",
+        })
     ]
 
-def parse_spi_log(path):
 
-    transactions = []
-    current = None
+bind_layers(SPI, SPIFlashCmd, cs=0)
 
+
+# ---------------------------------------------------------------------------
+# Normalized transaction
+# ---------------------------------------------------------------------------
+# Every parser below yields plain dicts of the same shape so the rest of the
+# tool never has to care which capture format produced them:
+#
+#   {"cmd": int, "addr": int | None, "data": bytes, "lines": int}
+#
+# ``data`` is the read payload (MISO / quad-data); ``lines`` is the lane width
+# used for the data phase (1 for single SPI, 4 for quad), purely informational.
+# ---------------------------------------------------------------------------
+
+
+def _read_record(cmd, addr, data, lines=1):
+    return {"cmd": cmd, "addr": addr, "data": bytes(data), "lines": lines}
+
+
+def parse_saleae_spi(path):
+    """Saleae 'SPI' analyzer data table: enable / result / disable rows."""
+    import csv
+
+    cur = None
     with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ttype = row["type"].strip('"') if row["type"] else ""
-            name = row["name"].strip('"') if row["name"] else ""
-
+        for row in csv.DictReader(f):
+            ttype = (row.get("type") or "").strip('"')
             if ttype == "enable":
-                current = {
-                    "start_time": float(row["start_time"]),
-                    "mosi": [],
-                    "miso": [],
-                    "times": [],
-                }
-
-            elif ttype == "result":
-                if current is None:
-                    continue
-
-                mosi_str = row["mosi"] or ""
-                miso_str = row["miso"] or ""
-
-                mosi_val = int(mosi_str, 16) if mosi_str.startswith("0x") else 0
-                miso_val = int(miso_str, 16) if miso_str.startswith("0x") else 0
-
-                current["mosi"].append(mosi_val)
-                current["miso"].append(miso_val)
-                current["times"].append(float(row["start_time"]))
-
-            elif ttype == "disable":
-                if current is not None:
-                    current["end_time"] = float(row["start_time"])
-                    if current["mosi"]:
-                        transactions.append(current)
-                    current = None
-
-    return transactions
-    
-
-def build_packets_from_spi_log(path, cs=0):
-
-    transactions = parse_spi_log(path)
-    results = []
-
-    for idx, tx in enumerate(transactions):
-        mosi = tx["mosi"]
-        miso = tx["miso"]
-
-        req, resp = build_eeprom_req_resp_from_bytes(mosi, miso)
-        if req is None:
-            continue
-
-        spi_req = SPI(cs=cs) / req
-
-        results.append({
-            "index": idx,
-            "spi_req": spi_req,
-            "req": req,
-            "resp": resp,
-            "mosi": bytes(mosi),
-            "miso": bytes(miso),
-            "start_time": tx["start_time"],
-            "end_time": tx.get("end_time"),
-            "times": tx["times"],
-        })
-
-    return results
+                cur = {"mosi": bytearray(), "miso": bytearray()}
+            elif ttype == "result" and cur is not None:
+                mo = row.get("mosi") or ""
+                mi = row.get("miso") or ""
+                cur["mosi"].append(int(mo, 16) if mo.startswith("0x") else 0)
+                cur["miso"].append(int(mi, 16) if mi.startswith("0x") else 0)
+            elif ttype == "disable" and cur is not None:
+                if cur["mosi"]:
+                    yield _saleae_to_record(cur["mosi"], cur["miso"])
+                cur = None
 
 
-def build_eeprom_req_resp_from_bytes(mosi_bytes, miso_bytes):
+def parse_saleae_raw(path):
+    """Saleae raw per-byte table: Time,Packet ID,MOSI,MISO. Group by Packet ID."""
+    import csv
 
-    if not mosi_bytes:
-        return None, None
+    cur_id = None
+    mosi = bytearray()
+    miso = bytearray()
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            pid = row.get("Packet ID")
+            if pid != cur_id and mosi:
+                yield _saleae_to_record(mosi, miso)
+                mosi, miso = bytearray(), bytearray()
+            cur_id = pid
+            mo = (row.get("MOSI") or "").strip()
+            mi = (row.get("MISO") or "").strip()
+            mosi.append(int(mo, 16) if mo.startswith("0x") else 0)
+            miso.append(int(mi, 16) if mi.startswith("0x") else 0)
+    if mosi:
+        yield _saleae_to_record(mosi, miso)
 
-    cmd = mosi_bytes[0]
-    req = EEPROMReq(cmd=cmd)
-    offset = 1
 
-    if cmd in EEPROMReq.CMD_HAS_ADDR and len(mosi_bytes) >= offset + 3:
-        addr = (
-            (mosi_bytes[offset] << 16)
-            | (mosi_bytes[offset + 1] << 8)
-            | (mosi_bytes[offset + 2])
-        )
-        req.addr = addr
-        offset += 4
+def _saleae_to_record(mosi, miso):
+    """Turn a single-lane MOSI/MISO transaction into a normalized record.
 
-    if cmd in EEPROMReq.CMD_HAS_DATA and len(mosi_bytes) > offset:
-        data_out = bytes(mosi_bytes[offset:])
-        req.dlen = len(data_out)
-        req.data = data_out
+    Header = opcode (1) + address (3 or 4 if present) + dummy (1 if present);
+    everything after the header on MISO is read data.
+    """
+    cmd = mosi[0]
+    hdr = 1
+    addr = None
+    if cmd in SPIFlashCmd.CMD_HAS_ADDR:
+        nbytes = 4 if cmd in SPIFlashCmd.CMD_4B_ADDR else 3
+        if len(mosi) >= 1 + nbytes:
+            addr = int.from_bytes(bytes(mosi[1:1 + nbytes]), "big")
+            hdr += nbytes
+    if cmd in SPIFlashCmd.CMD_HAS_DUMMY:
+        hdr += 1
+    data = bytes(miso[hdr:]) if cmd in SPIFlashCmd.READ_COMMANDS else b""
+    return _read_record(cmd, addr, data, lines=1)
+
+
+def parse_qspi_analyzer(path):
+    """QSPI-Analyzer export: state machine (1=cmd, 2=addr, 3=dummy, 4=data).
+
+    Columns: Time [s], Packet ID, Transaction State, DATA, Lines Used.
+    A new state-1 row starts a new transaction (there is no explicit 'disable').
+    Data bytes are accumulated per transaction so the image can be filled with
+    one slice assignment instead of 38M single-byte writes.
+    """
+    cur = None
+    with open(path) as f:
+        header = f.readline()  # skip header
+        for line in f:
+            # Fast positional parse: time, pid, state, data, lines
+            parts = line.split(",")
+            if len(parts) < 4:
+                continue
+            state = parts[2]
+            val = parts[3]
+            if state == "1":  # command
+                if cur is not None:
+                    yield _qspi_finish(cur)
+                cur = {"cmd": int(val, 16), "addr": None,
+                       "data": bytearray(), "lines": 1}
+            elif cur is None:
+                continue
+            elif state == "2":  # address (pre-assembled by the analyzer)
+                cur["addr"] = int(val, 16)
+            elif state == "3":  # dummy cycles — nothing to store
+                pass
+            elif state == "4":  # one data byte
+                cur["data"].append(int(val, 16))
+                cur["lines"] = int(parts[4]) if len(parts) > 4 else cur["lines"]
+    if cur is not None:
+        yield _qspi_finish(cur)
+
+
+def _qspi_finish(cur):
+    return _read_record(cur["cmd"], cur["addr"], cur["data"], cur["lines"])
+
+
+# ---------------------------------------------------------------------------
+# Format detection + dispatch
+# ---------------------------------------------------------------------------
+def detect_parser(path):
+    with open(path) as f:
+        header = f.readline()
+    low = header.lower()
+    if "transaction state" in low:
+        return parse_qspi_analyzer, "qspi-analyzer"
+    if "type" in low and "mosi" in low:
+        return parse_saleae_spi, "saleae-spi"
+    if "packet id" in low and "mosi" in low:
+        return parse_saleae_raw, "saleae-raw"
+    raise ValueError(f"Unrecognized capture header: {header!r}")
+
+
+def iter_transactions(path):
+    parser, fmt = detect_parser(path)
+    logger.info("detected capture format: %s", fmt)
+    yield from parser(path)
+
+
+# ---------------------------------------------------------------------------
+# Scapy helpers + reconstruction
+# ---------------------------------------------------------------------------
+def to_packet(rec):
+    """Build a Scapy SPI()/SPIFlashCmd()[/resp] from a normalized record."""
+    req = SPIFlashCmd(cmd=rec["cmd"])
+    if rec["addr"] is not None:
+        req.addr = rec["addr"]
+    req.lines = rec["lines"]
+    pkt = SPI(cs=0) / req
 
     resp = None
-    if cmd == EEPROMReq.CMD_FAST_READ and len(miso_bytes) > offset:
-        data_in = bytes(miso_bytes[offset:])
-        resp = EEPROMResp(data=data_in)
-    elif cmd == EEPROMReq.CMD_RDSR and len(miso_bytes) > offset:
-        sr_val = miso_bytes[offset]
-        resp = EEPROMStatusResp(sr=sr_val)
-    return req, resp
+    if rec["cmd"] in SPIFlashCmd.READ_COMMANDS and rec["data"]:
+        resp = SPIFlashReadResp(data=rec["data"])
+    elif rec["cmd"] == 0x05 and rec["data"]:
+        resp = SPIFlashStatusResp(sr=rec["data"][0])
+    return pkt, resp
 
 
-def reconstruct_flash_image(packets, flash_size=None, fill=0xFF):
-    read_segments = []
+def _data_lanes_ok(rec):
+    """True if a read's data was captured at the lane width its opcode uses.
 
-    for info in packets:
-        req = info["req"]
-        resp = info.get("resp")
+    A single-lane analyzer reports lines=1 for everything; for a quad opcode
+    (0x6B/0xEB/...) that means the data phase was mis-decoded, so we drop it.
+    """
+    req = SPIFlashCmd.DATA_LANES.get(rec["cmd"])
+    return req is None or rec["lines"] == req
 
-        if req.cmd != EEPROMReq.CMD_FAST_READ or resp is None:
-            continue
 
-        addr = getattr(req, "addr", None)
-        if addr is None:
-            continue
+def reconstruct_image(paths, flash_size=None, fill=0xFF):
+    """Replay read transactions from one or more captures into a flash image.
 
-        data = resp.data or b""
-        if not data:
-            continue
+    ``paths`` may be a single path or a list. Multiple captures are *merged* in
+    order — later captures overwrite earlier ones where they overlap — which is
+    how a single-lane U-Boot leg and a QSPI rootfs leg combine into one image.
+    Reads whose data lane width doesn't match the opcode are dropped (see
+    ``_data_lanes_ok``), so a single-lane capture's mis-decoded quad reads can't
+    poison the result.
+    """
+    if isinstance(paths, (str, bytes)):
+        paths = [paths]
 
-        start = addr
-        end = addr + len(data)
-        read_segments.append((start, end, data))
+    segments = []      # (addr, data) in application order
+    cmd_counts = Counter()
+    per_file = Counter()
+    dropped = 0
+    max_addr = 0
 
-    if not read_segments:
-        raise ValueError("No READ transactions with data found; cannot reconstruct image.")
+    for path in paths:
+        for rec in iter_transactions(path):
+            cmd_counts[rec["cmd"]] += 1
+            if rec["cmd"] not in SPIFlashCmd.READ_COMMANDS:
+                continue
+            if rec["addr"] is None or not rec["data"]:
+                continue
+            if not _data_lanes_ok(rec):
+                dropped += 1
+                continue
+            max_addr = max(max_addr, rec["addr"])
+            segments.append((rec["addr"], rec["data"]))
+            per_file[path] += 1
 
-    max_end = max(end for (_, end, _) in read_segments)
+    if not segments:
+        raise ValueError("No usable read transactions found.")
+
     if flash_size is None:
-        flash_size = max_end
+        # Size from the highest *start* address (real flash is power-of-two
+        # sized). A read near the top can spill a few bytes past the boundary;
+        # those get clipped below rather than bumping us to the next size up.
+        flash_size = 1 << (max_addr.bit_length())
 
-    image = bytearray([fill] * flash_size)
-    coverage = bytearray([0] * flash_size)
-
-    for start, end, data in read_segments:
-        if start >= flash_size:
+    image = bytearray([fill]) * flash_size
+    coverage = bytearray(flash_size)
+    for addr, data in segments:
+        if addr >= flash_size:
             continue
-        if end > flash_size:
-            data = data[: flash_size - start]
-            end = flash_size
-
-        image[start:end] = data
-        for i in range(start, end):
+        end = min(addr + len(data), flash_size)
+        image[addr:end] = data[:end - addr]
+        for i in range(addr, end):
             coverage[i] = 1
 
+    covered = sum(coverage)
+    logger.info("commands seen: %s",
+                {SPIFlashCmd.COMMANDS.get(c, hex(c)): n
+                 for c, n in cmd_counts.most_common()})
+    if dropped:
+        logger.info("dropped %d reads with wrong data-lane width "
+                    "(quad reads mis-decoded by a single-lane analyzer)", dropped)
+    if len(paths) > 1:
+        for p in paths:
+            logger.info("  merged %-50s %d reads", p, per_file[p])
+    logger.info("flash_size=0x%x  read_txns=%d  covered=%d (%.1f%%)",
+                flash_size, len(segments), covered, 100 * covered / flash_size)
     return bytes(image), coverage
 
-if __name__ == "__main__":
-    path = sys.argv[1]
 
-    packets = build_packets_from_spi_log(path)
-    print(f"Decoded {len(packets)} SPI transactions")
-    
-    for info in packets:
-        req = info["req"]
-        if req.cmd == EEPROMReq.CMD_RDSR:
-            print(f"\n=== RDSR transaction #{info['index']} ===")
-            print(f"Time: {info['start_time']} -> {info['end_time']}")
-            info["spi_req"].show()
-            resp = info.get("resp")
-            if resp is not None:
-                print("Decoded status register:")
-                resp.show()
-            else:
-                print("No status response captured.")
-    image, coverage = reconstruct_flash_image(packets, flash_size=None)
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("capture", help="logic-analyzer export (SPI or QSPI)")
+    ap.add_argument("--merge", nargs="+", default=[], metavar="CAPTURE",
+                    help="additional capture(s) to merge in, applied after (and "
+                         "overwriting) the primary one. Use to splice a "
+                         "single-lane U-Boot leg with a QSPI rootfs leg; "
+                         "lane-inconsistent reads are dropped automatically.")
+    ap.add_argument("-o", "--output", default="recovered_flash.bin",
+                    help="output image path (default: recovered_flash.bin)")
+    ap.add_argument("--flash-size", type=lambda s: int(s, 0), default=None,
+                    help="force flash size in bytes (e.g. 0x1000000); "
+                         "default rounds up to next power of two")
+    ap.add_argument("--fill", type=lambda s: int(s, 0), default=0xFF,
+                    help="fill byte for un-read regions (default 0xFF)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
 
-    with open("recovered_flash.bin", "wb") as f:
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(message)s",
+    )
+
+    paths = [args.capture] + args.merge
+    image, _ = reconstruct_image(paths,
+                                 flash_size=args.flash_size, fill=args.fill)
+    with open(args.output, "wb") as f:
         f.write(image)
+    print(f"wrote {len(image)} bytes -> {args.output}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
