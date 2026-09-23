@@ -169,17 +169,66 @@ def parse_saleae_spi(path):
                 cur = None
 
 
-def parse_saleae_raw(path):
-    """Saleae raw per-byte table: Time,Packet ID,MOSI,MISO. Group by Packet ID."""
+# Idle time (in byte periods) that marks a chip-select boundary when a raw
+# export has no usable Packet IDs. Overridden by --gap.
+GAP_FACTOR = 4
+
+
+def _raw_gap_threshold(path, probe_rows=10000):
+    """Decide whether a raw export needs timing-gap splitting, and at what gap.
+
+    If the capture was exported without chip-select framing, every row carries
+    the same Packet ID and grouping by it collapses the whole boot into one
+    transaction. Probe the first rows: if the Packet ID never changes, fall back
+    to splitting on idle gaps longer than GAP_FACTOR x the median byte period.
+    Returns the gap in seconds, or None if Packet IDs are usable.
+    """
+    import csv
+    import itertools
+    import statistics
+
+    with open(path, newline="") as f:
+        rows = list(itertools.islice(csv.DictReader(f), probe_rows))
+    if len({r.get("Packet ID") for r in rows}) > 1:
+        return None
+    times = [float(r["Time [s]"]) for r in rows]
+    deltas = [b - a for a, b in zip(times, times[1:]) if b > a]
+    if not deltas:
+        return None
+    return GAP_FACTOR * statistics.median(deltas)
+
+
+def parse_saleae_raw(path, gap=None):
+    """Saleae raw per-byte table: Time,Packet ID,MOSI,MISO. Group by Packet ID.
+
+    Falls back to splitting on timing gaps when Packet IDs are missing or
+    constant (see ``_raw_gap_threshold``). ``gap`` forces a threshold in seconds.
+    """
     import csv
 
+    if gap is None:
+        gap = _raw_gap_threshold(path)
+        if gap is not None:
+            logger.warning("%s: Packet ID is constant (no chip-select framing); "
+                           "splitting transactions on idle gaps > %.3g s",
+                           path, gap)
+    elif gap:
+        logger.info("splitting transactions on idle gaps > %.3g s", gap)
+
     cur_id = None
+    prev_t = None
     mosi = bytearray()
     miso = bytearray()
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             pid = row.get("Packet ID")
-            if pid != cur_id and mosi:
+            if gap:
+                t = float(row["Time [s]"])
+                boundary = prev_t is not None and t - prev_t > gap
+                prev_t = t
+            else:
+                boundary = pid != cur_id
+            if boundary and mosi:
                 yield _saleae_to_record(mosi, miso)
                 mosi, miso = bytearray(), bytearray()
             cur_id = pid
@@ -267,10 +316,13 @@ def detect_parser(path):
     raise ValueError(f"Unrecognized capture header: {header!r}")
 
 
-def iter_transactions(path):
+def iter_transactions(path, gap=None):
     parser, fmt = detect_parser(path)
     logger.info("detected capture format: %s", fmt)
-    yield from parser(path)
+    if parser is parse_saleae_raw:
+        yield from parser(path, gap=gap)
+    else:
+        yield from parser(path)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +354,12 @@ def _data_lanes_ok(rec):
     return req is None or rec["lines"] == req
 
 
-def reconstruct_image(paths, flash_size=None, fill=0xFF):
+# Smallest flash we'll auto-size to (64 KiB, e.g. a 25x05). Guards against a
+# capture whose reads all start at 0 producing a nonsensical 1-byte image.
+MIN_FLASH_SIZE = 0x10000
+
+
+def reconstruct_image(paths, flash_size=None, fill=0xFF, gap=None):
     """Replay read transactions from one or more captures into a flash image.
 
     ``paths`` may be a single path or a list. Multiple captures are *merged* in
@@ -310,7 +367,8 @@ def reconstruct_image(paths, flash_size=None, fill=0xFF):
     how a single-lane U-Boot leg and a QSPI rootfs leg combine into one image.
     Reads whose data lane width doesn't match the opcode are dropped (see
     ``_data_lanes_ok``), so a single-lane capture's mis-decoded quad reads can't
-    poison the result.
+    poison the result. ``gap`` forces timing-gap splitting for raw exports
+    (see ``parse_saleae_raw``).
     """
     if isinstance(paths, (str, bytes)):
         paths = [paths]
@@ -322,7 +380,7 @@ def reconstruct_image(paths, flash_size=None, fill=0xFF):
     max_addr = 0
 
     for path in paths:
-        for rec in iter_transactions(path):
+        for rec in iter_transactions(path, gap=gap):
             cmd_counts[rec["cmd"]] += 1
             if rec["cmd"] not in SPIFlashCmd.READ_COMMANDS:
                 continue
@@ -342,7 +400,7 @@ def reconstruct_image(paths, flash_size=None, fill=0xFF):
         # Size from the highest *start* address (real flash is power-of-two
         # sized). A read near the top can spill a few bytes past the boundary;
         # those get clipped below rather than bumping us to the next size up.
-        flash_size = 1 << (max_addr.bit_length())
+        flash_size = max(1 << max_addr.bit_length(), MIN_FLASH_SIZE)
 
     image = bytearray([fill]) * flash_size
     coverage = bytearray(flash_size)
@@ -353,6 +411,14 @@ def reconstruct_image(paths, flash_size=None, fill=0xFF):
         image[addr:end] = data[:end - addr]
         for i in range(addr, end):
             coverage[i] = 1
+
+    # Reads running well past the end mean the size is wrong or transactions
+    # were mis-framed (e.g. a raw export with no chip-select boundaries).
+    clipped = sum(max(0, a + len(d) - flash_size) for a, d in segments)
+    if clipped > 0x1000:
+        logger.warning("clipped %d bytes of read data past flash_size=0x%x; "
+                       "check --flash-size or transaction framing (--gap)",
+                       clipped, flash_size)
 
     covered = sum(coverage)
     logger.info("commands seen: %s",
@@ -387,6 +453,12 @@ def main(argv=None):
                          "default rounds up to next power of two")
     ap.add_argument("--fill", type=lambda s: int(s, 0), default=0xFF,
                     help="fill byte for un-read regions (default 0xFF)")
+    ap.add_argument("--gap", type=float, default=None, metavar="SECONDS",
+                    help="split raw (Time,Packet ID,MOSI,MISO) exports into "
+                         "transactions on idle gaps longer than this; 0 forces "
+                         "Packet ID grouping. Default: auto, used only when "
+                         "Packet ID is constant (%dx median byte period)"
+                         % GAP_FACTOR)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -397,7 +469,8 @@ def main(argv=None):
 
     paths = [args.capture] + args.merge
     image, _ = reconstruct_image(paths,
-                                 flash_size=args.flash_size, fill=args.fill)
+                                 flash_size=args.flash_size, fill=args.fill,
+                                 gap=args.gap)
     with open(args.output, "wb") as f:
         f.write(image)
     print(f"wrote {len(image)} bytes -> {args.output}")

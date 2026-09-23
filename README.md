@@ -33,6 +33,11 @@ python main.py big-quad-spi-analyzed-dump.txt -o quad.bin -v
 # dropped automatically, so a mixed capture can't poison the result.
 python main.py single_lane_boot.csv --merge quad_boot.txt -o full.bin -v
 
+# Raw exports with no chip-select framing (Packet ID constant) are split on
+# idle gaps automatically (4x median byte period); override the threshold with
+# --gap SECONDS, or --gap 0 to force Packet ID grouping
+python main.py raw_boot.csv --gap 2e-6 -o raw.bin -v
+
 # Force a flash size / fill byte if the auto-sizing guesses wrong
 python main.py capture.txt --flash-size 0x1000000 --fill 0xFF -o out.bin
 ```
@@ -42,6 +47,17 @@ flash size, and read coverage. Un-read regions are filled with `0xFF` (the
 erased-NOR state), so the output is safe to feed straight into `binwalk`.
 
 ## How it works
+
+A flash read is the same logical transaction regardless of wire width: an
+opcode, an address, and a run of data bytes. The two traces below read the
+same four bytes (the SquashFS magic `hsqs` at `0x2D0000`, taken from
+`bigger-boot.csv`) in single-lane and quad mode:
+
+![Single-lane SPI 0x03 READ](docs/diagrams/spi_read.svg)
+
+![Quad SPI 0x6B FAST_READ_QUAD_OUT](docs/diagrams/qspi_read.svg)
+
+(Regenerate with `docs/diagrams/mkwave.py` + `wavedrom-cli`.)
 
 1. A front-end parser turns the capture into normalized read records
    `{cmd, addr, data, lines}`.
