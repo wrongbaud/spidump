@@ -64,6 +64,7 @@ class SPIFlashCmd(Packet):
         0x6C: "FAST_READ_QUAD_OUT_4B",  # 1-1-4, 32-bit addr, +dummy
         0x02: "PAGE_PROGRAM",
         0x20: "SECTOR_ERASE",
+        0xD8: "BLOCK_ERASE",
         0x05: "RDSR1",
         0x35: "RDSR2",
         0x06: "WREN",
@@ -74,7 +75,7 @@ class SPIFlashCmd(Packet):
     # Commands whose data we can place back into the image at an address.
     READ_COMMANDS = {0x03, 0x0B, 0x3B, 0x6B, 0xEB, 0x0C, 0x6C}
     # Commands that clock out an address after the opcode.
-    CMD_HAS_ADDR = {0x03, 0x0B, 0x3B, 0x6B, 0xEB, 0x0C, 0x6C, 0x02, 0x20}
+    CMD_HAS_ADDR = {0x03, 0x0B, 0x3B, 0x6B, 0xEB, 0x0C, 0x6C, 0x02, 0x20, 0xD8}
     # ...and of those, which insert dummy cycles before data starts.
     CMD_HAS_DUMMY = {0x0B, 0x3B, 0x6B, 0xEB, 0x0C, 0x6C}
     # Commands using a 32-bit (4-byte) address instead of the usual 24-bit.
