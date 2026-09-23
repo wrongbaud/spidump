@@ -107,7 +107,9 @@ class SPIFlashCmd(Packet):
 class SPIFlashReadResp(Packet):
     name = "SPIFlashReadResp"
     fields_desc = [
-        FieldLenField("dlen", None, count_of="data", fmt="H"),
+        # length_of (not count_of): count_of counts list elements and yields 1
+        # for a bytes field. 32-bit because a single boot read can exceed 64 KiB.
+        FieldLenField("dlen", None, length_of="data", fmt="I"),
         StrLenField("data", b"", length_from=lambda p: p.dlen),
     ]
 
@@ -409,8 +411,7 @@ def reconstruct_image(paths, flash_size=None, fill=0xFF, gap=None):
             continue
         end = min(addr + len(data), flash_size)
         image[addr:end] = data[:end - addr]
-        for i in range(addr, end):
-            coverage[i] = 1
+        coverage[addr:end] = b"\x01" * (end - addr)
 
     # Reads running well past the end mean the size is wrong or transactions
     # were mis-framed (e.g. a raw export with no chip-select boundaries).
