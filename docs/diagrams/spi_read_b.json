@@ -1,0 +1,42 @@
+{
+  "signal": [
+    {
+      "name": "CS#",
+      "wave": "0........................1"
+    },
+    {
+      "name": "SCK",
+      "wave": "lppppppppppppppppppppppppl"
+    },
+    {
+      "name": "MOSI",
+      "wave": "x........................."
+    },
+    {
+      "name": "MISO",
+      "wave": "z=.......=.......=.......z",
+      "data": [
+        "0x68 'h'",
+        "0x73 's'",
+        "0x71 'q'"
+      ]
+    },
+    {},
+    {
+      "name": "phase",
+      "wave": "x=.......................x",
+      "data": [
+        "data (MISO, 1 bit/clk)"
+      ]
+    }
+  ],
+  "head": {
+    "tick": 31
+  },
+  "foot": {
+    "text": "SquashFS superblock read at 0x2D0000"
+  },
+  "config": {
+    "hscale": 1
+  }
+}

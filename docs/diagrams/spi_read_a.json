@@ -1,0 +1,41 @@
+{
+  "signal": [
+    {
+      "name": "CS#",
+      "wave": "10................................"
+    },
+    {
+      "name": "SCK",
+      "wave": "lppppppppppppppppppppppppppppppppp"
+    },
+    {
+      "name": "MOSI",
+      "wave": "x0.....1.=.......=.......=.......x",
+      "data": [
+        "0x2D",
+        "0x00",
+        "0x00"
+      ]
+    },
+    {
+      "name": "MISO",
+      "wave": "z................................."
+    },
+    {},
+    {
+      "name": "phase",
+      "wave": "x=.......=.......................x",
+      "data": [
+        "cmd 0x03 READ",
+        "addr 0x2D0000 (24-bit)"
+      ]
+    }
+  ],
+  "head": {
+    "text": "Single-lane SPI read \u2014 0x03 READ (1-1-1)",
+    "tick": -1
+  },
+  "config": {
+    "hscale": 1
+  }
+}

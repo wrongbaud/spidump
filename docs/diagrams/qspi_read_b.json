@@ -1,0 +1,56 @@
+{
+  "signal": [
+    {
+      "name": "CS#",
+      "wave": "0................1"
+    },
+    {
+      "name": "SCK",
+      "wave": "lppppppppppppppppl"
+    },
+    {
+      "name": "IO0 (SI/SO)",
+      "wave": "xz.......0.1.....z"
+    },
+    {
+      "name": "IO1 (SO)",
+      "wave": "z........101..01.z"
+    },
+    {
+      "name": "IO2 (WP#)",
+      "wave": "z........10101010z"
+    },
+    {
+      "name": "IO3 (HOLD#)",
+      "wave": "z........010.....z"
+    },
+    {},
+    {
+      "name": "byte",
+      "wave": "x........=.=.=.=.x",
+      "data": [
+        "0x68",
+        "0x73",
+        "0x71",
+        "0x73"
+      ]
+    },
+    {
+      "name": "phase",
+      "wave": "x=.......=.......x",
+      "data": [
+        "8 dummy clk",
+        "data \u00d74"
+      ]
+    }
+  ],
+  "head": {
+    "tick": 31
+  },
+  "foot": {
+    "text": "Same 4 bytes (\"hsqs\") in 8 clocks instead of 32 \u2014 IO3..IO0 carry bits 7..4 then 3..0"
+  },
+  "config": {
+    "hscale": 1
+  }
+}

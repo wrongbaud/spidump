@@ -57,7 +57,7 @@ same four bytes (the SquashFS magic `hsqs` at `0x2D0000`, taken from
 
 ![Quad SPI 0x6B FAST_READ_QUAD_OUT](docs/diagrams/qspi_read.svg)
 
-(Regenerate with `docs/diagrams/mkwave.py` + `wavedrom-cli`.)
+(Regenerate with `python docs/diagrams/mkwave.py`; needs `wavedrom-cli`, and `rsvg-convert` for the PNGs.)
 
 1. A front-end parser turns the capture into normalized read records
    `{cmd, addr, data, lines}`.

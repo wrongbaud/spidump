@@ -1,0 +1,49 @@
+{
+  "signal": [
+    {
+      "name": "CS#",
+      "wave": "10................................"
+    },
+    {
+      "name": "SCK",
+      "wave": "lppppppppppppppppppppppppppppppppp"
+    },
+    {
+      "name": "IO0 (SI/SO)",
+      "wave": "x01.0101.=.......=.......=.......z",
+      "data": [
+        "0x2D",
+        "0x00",
+        "0x00"
+      ]
+    },
+    {
+      "name": "IO1 (SO)",
+      "wave": "z................................."
+    },
+    {
+      "name": "IO2 (WP#)",
+      "wave": "z................................."
+    },
+    {
+      "name": "IO3 (HOLD#)",
+      "wave": "z................................."
+    },
+    {},
+    {
+      "name": "phase",
+      "wave": "x=.......=.......................x",
+      "data": [
+        "cmd 0x6B",
+        "addr 0x2D0000 (IO0 only)"
+      ]
+    }
+  ],
+  "head": {
+    "text": "Quad SPI read \u2014 0x6B FAST_READ_QUAD_OUT (1-1-4)",
+    "tick": -1
+  },
+  "config": {
+    "hscale": 1
+  }
+}
