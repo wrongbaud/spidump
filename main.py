@@ -16,6 +16,7 @@ Scapy model and the same ``reconstruct_image`` routine handle all three.
 """
 
 import argparse
+import struct
 import sys
 import logging
 from collections import Counter
@@ -25,6 +26,8 @@ from scapy.fields import (
     ByteEnumField,
     ByteField,
     ThreeBytesField,
+    IntField,
+    MultipleTypeField,
     ConditionalField,
     FieldLenField,
     StrLenField,
@@ -94,7 +97,11 @@ class SPIFlashCmd(Packet):
     fields_desc = [
         ByteEnumField("cmd", CMD_READ, COMMANDS),
         ConditionalField(
-            ThreeBytesField("addr", 0),
+            # 24-bit address, or 32-bit for the 4-byte-address opcodes
+            MultipleTypeField(
+                [(IntField("addr", 0), lambda p: p.cmd in p.CMD_4B_ADDR)],
+                ThreeBytesField("addr", 0),
+            ),
             lambda p: p.cmd in p.CMD_HAS_ADDR,
         ),
         ConditionalField(
@@ -245,21 +252,23 @@ def parse_saleae_raw(path, gap=None):
 def _saleae_to_record(mosi, miso):
     """Turn a single-lane MOSI/MISO transaction into a normalized record.
 
-    Header = opcode (1) + address (3 or 4 if present) + dummy (1 if present);
-    everything after the header on MISO is read data.
+    Scapy dissects the MOSI bytes into opcode / address / dummy per the
+    ``SPIFlashCmd`` model; the don't-care bytes clocked out during the data
+    phase land in the Raw payload. The dissected header's length is where the
+    read data starts on MISO.
     """
-    cmd = mosi[0]
-    hdr = 1
-    addr = None
-    if cmd in SPIFlashCmd.CMD_HAS_ADDR:
-        nbytes = 4 if cmd in SPIFlashCmd.CMD_4B_ADDR else 3
-        if len(mosi) >= 1 + nbytes:
-            addr = int.from_bytes(bytes(mosi[1:1 + nbytes]), "big")
-            hdr += nbytes
-    if cmd in SPIFlashCmd.CMD_HAS_DUMMY:
-        hdr += 1
-    data = bytes(miso[hdr:]) if cmd in SPIFlashCmd.READ_COMMANDS else b""
-    return _read_record(cmd, addr, data, lines=1)
+    if mosi[0] not in SPIFlashCmd.READ_COMMANDS:
+        # Status polls, WREN, etc. never land in the image; skip dissecting
+        # them (hundreds of thousands per boot) and just count the opcode.
+        return _read_record(mosi[0], None, b"", lines=1)
+    try:
+        req = SPIFlashCmd(bytes(mosi))
+    except struct.error:
+        # Transaction ended mid-header (e.g. CS# raised early): no usable
+        # address or data, just keep the opcode for the command histogram.
+        return _read_record(mosi[0], None, b"", lines=1)
+    hdr_len = len(req.self_build())
+    return _read_record(req.cmd, req.addr, bytes(miso[hdr_len:]), lines=1)
 
 
 def parse_qspi_analyzer(path):
