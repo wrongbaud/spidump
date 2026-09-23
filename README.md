@@ -12,9 +12,9 @@ four.
 |--------|--------|-------|
 | Saleae Logic 2 "SPI" analyzer table | `name,type,start_time,...,mosi,miso` | `enable`/`result`/`disable` rows, one `result` per byte |
 | Saleae raw per-byte table | `Time [s],Packet ID,MOSI,MISO` | one row per byte, grouped by Packet ID |
-| QSPI-Analyzer export | `Time [s],Packet ID, Transaction State, DATA, Lines Used` | state machine: 1=cmd, 2=addr, 3=dummy, 4=data |
+| [QSPI-Analyzer](https://github.com/AddioElectronics/QSPI-Analyzer) export | `Time [s],Packet ID, Transaction State, DATA, Lines Used` | state machine: 1=cmd, 2=addr, 3=dummy, 4=data |
 
-The QSPI-Analyzer plugin (see `../QSPI-Analyzer`) decodes quad-mode framing
+The [QSPI-Analyzer](https://github.com/AddioElectronics/QSPI-Analyzer) plugin for Saleae Logic / KingstVIS decodes quad-mode framing
 (e.g. `0x6B` Fast Read Quad Output, `1-1-4`) that a plain SPI analyzer can't.
 
 ## Usage
